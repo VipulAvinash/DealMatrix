@@ -1,10 +1,11 @@
 import { z } from "zod";
-import { searchProducts } from "../services/productSearch.service.js";
+import { searchProducts, normalizeProduct } from "../services/productSearch.service.js";
 import Product from "../models/Product.model.js";
 import User from "../models/User.model.js";
 import { asyncWrapper, sendSuccess, sendPaginated, AppError } from "../utils/responseHelper.js";
 import { checkPromptInjection, sanitizeQuery } from "../utils/promptGuard.js";
 import { logger } from "../utils/logger.js";
+import { getCache, setCache } from "../services/cache/cacheService.js";
 
 const searchQuerySchema = z.object({
   q: z.string().min(1, "Search query required").max(200),
@@ -100,9 +101,21 @@ export const search = asyncWrapper(async (req, res) => {
  *     tags: [Products]
  */
 export const getProduct = asyncWrapper(async (req, res) => {
+  // Try to get product from Redis cache first
+  const cached = await getCache(`product:${req.params.id}`);
+  if (cached) {
+    const normalizedProduct = normalizeProduct(cached.data);
+    return sendSuccess(res, normalizedProduct, "Product fetched");
+  }
+
   const product = await Product.findById(req.params.id).select("-embeddings");
   if (!product) throw new AppError("Product not found", 404);
-  sendSuccess(res, product, "Product fetched");
+  
+  const normalizedProduct = normalizeProduct(product);
+  // Cache it for subsequent requests
+  await setCache(`product:${product._id}`, product, 60 * 60);
+
+  sendSuccess(res, normalizedProduct, "Product fetched");
 });
 
 /**
@@ -119,17 +132,38 @@ export const compareProducts = asyncWrapper(async (req, res) => {
     throw new AppError("Please provide 2-5 product IDs for comparison", 400);
   }
 
-  const products = await Product.find({ _id: { $in: productIds } }).select("-embeddings");
+  // Find products in DB
+  const dbProducts = await Product.find({ _id: { $in: productIds } }).select("-embeddings");
+
+  // Fallback to Redis cache for any products that are not yet in the DB
+  const foundIds = new Set(dbProducts.map((p) => p._id.toString()));
+  const missingIds = productIds.filter((id) => !foundIds.has(id));
+
+  const cachedProducts = [];
+  if (missingIds.length > 0) {
+    await Promise.all(
+      missingIds.map(async (id) => {
+        const cached = await getCache(`product:${id}`);
+        if (cached && cached.data) {
+          cachedProducts.push(cached.data);
+        }
+      })
+    );
+  }
+
+  const products = [...dbProducts, ...cachedProducts];
 
   if (products.length < 2) {
     throw new AppError("At least 2 valid products required for comparison", 400);
   }
 
+  const normalizedProducts = products.map((p) => normalizeProduct(p));
+
   // Build comparison table
   const comparison = {
-    products,
-    attributes: buildComparisonAttributes(products),
-    winner: determineWinner(products),
+    products: normalizedProducts,
+    attributes: buildComparisonAttributes(normalizedProducts),
+    winner: determineWinner(normalizedProducts),
   };
 
   sendSuccess(res, comparison, "Products compared");
@@ -148,8 +182,21 @@ export const saveProduct = asyncWrapper(async (req, res) => {
   const { productId } = req.body;
   if (!productId) throw new AppError("Product ID required", 400);
 
-  const product = await Product.findById(productId);
-  if (!product) throw new AppError("Product not found", 404);
+  let product = await Product.findById(productId);
+  
+  // If product is not in DB yet (fresh from search results), save it from cache
+  if (!product) {
+    const cached = await getCache(`product:${productId}`);
+    if (cached && cached.data) {
+      product = new Product({
+        ...cached.data,
+        embeddings: undefined, // no embedding saved directly
+      });
+      await product.save();
+    } else {
+      throw new AppError("Product not found", 404);
+    }
+  }
 
   const user = await User.findById(req.user._id);
   const alreadySaved = user.savedProducts.includes(productId);

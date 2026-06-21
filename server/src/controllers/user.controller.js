@@ -2,6 +2,7 @@ import User from "../models/User.model.js";
 import SearchHistory from "../models/SearchHistory.model.js";
 import Product from "../models/Product.model.js";
 import { asyncWrapper, sendSuccess, sendPaginated } from "../utils/responseHelper.js";
+import { normalizeProduct } from "../services/productSearch.service.js";
 
 /**
  * GET /api/user/profile
@@ -10,6 +11,10 @@ export const getProfile = asyncWrapper(async (req, res) => {
   const user = await User.findById(req.user._id)
     .populate("savedProducts", "-embeddings")
     .lean();
+
+  if (user && user.savedProducts) {
+    user.savedProducts = user.savedProducts.map((p) => normalizeProduct(p));
+  }
 
   sendSuccess(res, user, "Profile loaded");
 });
@@ -50,7 +55,8 @@ export const getSavedProducts = asyncWrapper(async (req, res) => {
     })
     .lean();
 
-  sendSuccess(res, user.savedProducts || [], "Saved products loaded");
+  const normalizedSaved = (user.savedProducts || []).map((p) => normalizeProduct(p));
+  sendSuccess(res, normalizedSaved, "Saved products loaded");
 });
 
 /**

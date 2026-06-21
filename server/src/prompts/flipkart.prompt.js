@@ -13,6 +13,8 @@ Search query: "${query}"${filterStr}
 
 Return a JSON array of 6-8 realistic Flipkart product listings. Products must reflect what is actually sold on Flipkart.com — Indian market pricing in INR, Flipkart-specific logistics and seller ecosystem.
 
+Do NOT use generic placeholders for URLs or images. You must return real, actual, or highly accurate product detail page URLs and real, working product image URLs from Flipkart's CDN (rukminim2.flixcart.com/image/...) that match the exact product model. Ensure each product has a unique, correct image corresponding to its specific color/model.
+
 Required JSON structure (return ONLY the array, no markdown, no explanation):
 [
   {
@@ -47,11 +49,11 @@ Required JSON structure (return ONLY the array, no markdown, no explanation):
       "Specific feature with spec (e.g. 5000mAh battery with 67W fast charging)",
       "Specific feature with spec"
     ],
-    "images": ["https://rukminim2.flixcart.com/image/placeholder.jpg"],
+    "images": ["https://rukminim2.flixcart.com/image/312/312/xif0q/mobile/9/e/e/-original-imaghx9q5rvddghy.jpeg"],
     "source": {
       "platform": "flipkart",
-      "url": "https://www.flipkart.com/product/p/placeholder",
-      "productId": "PLACEHOLDER123456"
+      "url": "https://www.flipkart.com/apple-iphone-14-blue-128-gb/p/itm9e6393c400496",
+      "productId": "MOBGHWFHSVUXCPFB"
     },
     "tags": ["relevant", "search", "tags"],
     "badges": ["Flipkart Choice"],
@@ -74,6 +76,7 @@ Constraints:
 - features: specific specs with numbers, no vague marketing copy
 - highlights.exchangeOffer: realistic exchange values per product price range
 - highlights.bankOffer: use Flipkart Axis Bank Card, ICICI, or Kotak offers
+- image and url: must be real and specific to the exact product model. Do not repeat the same image or use placeholders.
 - all products must be directly relevant to: "${query}"`;
 };
 

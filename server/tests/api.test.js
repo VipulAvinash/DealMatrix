@@ -6,7 +6,12 @@
  */
 
 import request from "supertest";
+import mongoose from "mongoose";
 import app from "../src/app.js";
+
+afterAll(async () => {
+  await mongoose.disconnect();
+});
 
 // ── Auth routes ───────────────────────────────────────────────────────────────
 describe("POST /api/auth/register", () => {

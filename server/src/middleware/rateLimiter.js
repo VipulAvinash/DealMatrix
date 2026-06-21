@@ -17,8 +17,12 @@ const createLimiter = (options) =>
       res.status(429).json(options.message);
     },
     skip: (req) => {
-      // Skip rate limiting for health checks
-      return req.path === "/health";
+      // Skip rate limiting for health checks and socket.io connections
+      return (
+        req.path === "/health" ||
+        req.originalUrl?.startsWith("/socket.io") ||
+        req.path?.startsWith("/socket.io")
+      );
     },
   });
 

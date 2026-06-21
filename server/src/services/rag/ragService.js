@@ -12,55 +12,116 @@ import { logger } from "../../utils/logger.js";
  * @param {number} limit - Max results to return
  * @returns {Promise<Array>} Matching products
  */
-export const ragSearch = async (query, limit = 10) => {
+/**
+ * Local vector search using in-memory cosine similarity calculation
+ */
+const localVectorSearch = async (embedding, limit) => {
   try {
-    // Step 1: Try vector embedding search
-    const embedding = await generateEmbedding(query);
+    if (!embedding || !Array.isArray(embedding)) return [];
 
-    if (embedding && Array.isArray(embedding)) {
-      // Try MongoDB Atlas Vector Search (if configured)
-      try {
-        const vectorResults = await Product.aggregate([
-          {
-            $vectorSearch: {
-              index: "product_embeddings",
-              path: "embeddings",
-              queryVector: embedding,
-              numCandidates: limit * 5,
-              limit,
-            },
-          },
-          {
-            $project: {
-              name: 1,
-              price: 1,
-              rating: 1,
-              source: 1,
-              category: 1,
-              brand: 1,
-              aiSummary: 1,
-              score: { $meta: "vectorSearchScore" },
-            },
-          },
-        ]);
+    // Fetch all products that have embeddings
+    const products = await Product.find({ embeddings: { $exists: true, $ne: [] } })
+      .select("+embeddings")
+      .lean();
 
-        if (vectorResults.length > 0) {
-          logger.info(`[RAG] Vector search returned ${vectorResults.length} results`);
-          return { results: vectorResults, source: "vector" };
-        }
-      } catch (vectorErr) {
-        // Atlas Vector Search not configured — fall through to text search
-        logger.debug("[RAG] Vector search unavailable, using text search:", vectorErr.message);
-      }
+    if (products.length === 0) return [];
+
+    // Calculate cosine similarity for each product
+    const scoredProducts = products.map((product) => {
+      const sim = cosineSimilarity(embedding, product.embeddings);
+      return { ...product, score: sim };
+    });
+
+    // Filter by threshold (0.75) and sort descending
+    const matchedProducts = scoredProducts
+      .filter((p) => p.score >= 0.75)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+
+    if (matchedProducts.length > 0) {
+      logger.info(`[RAG/Local Vector] Cosine similarity returned ${matchedProducts.length} results`);
+      // Strip embeddings from the output for clean data propagation
+      matchedProducts.forEach((p) => delete p.embeddings);
+      return matchedProducts;
     }
 
-    // Step 2: Fall back to MongoDB full-text search
-    const textResults = await mongoTextSearch(query, limit);
-    return { results: textResults, source: "text" };
+    return [];
   } catch (err) {
-    logger.error("[RAG] Search failed:", err.message);
-    return { results: [], source: "none" };
+    logger.warn("[RAG/Local Vector] Local vector search failed:", err.message);
+    return [];
   }
+};
+
+const cosineSimilarity = (vecA, vecB) => {
+  if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < vecA.length; i++) {
+    dotProduct += vecA[i] * vecB[i];
+    normA += vecA[i] * vecA[i];
+    normB += vecB[i] * vecB[i];
+  }
+  return normA && normB ? dotProduct / (Math.sqrt(normA) * Math.sqrt(normB)) : 0;
+};
+
+/**
+ * Search products using RAG / Vector search
+ * Branch strategy based on environment configuration
+ */
+export const ragSearch = async (query, embedding, limit = 10) => {
+  const useAtlas = process.env.MONGODB_ENV === "atlas";
+
+  if (useAtlas) {
+    // Primary: Atlas Vector Search (semantic) — requires Atlas Search index
+    try {
+      const results = await Product.aggregate([
+        {
+          $vectorSearch: {
+            index: "product_embeddings",
+            path: "embeddings",
+            queryVector: embedding,
+            numCandidates: 100,
+            limit,
+          },
+        },
+        {
+          $project: {
+            name: 1,
+            price: 1,
+            rating: 1,
+            source: 1,
+            category: 1,
+            brand: 1,
+            images: 1,
+            aiSummary: 1,
+            score: { $meta: "vectorSearchScore" },
+          },
+        },
+        { $match: { score: { $gte: 0.75 } } },
+      ]);
+      logger.info(`[RAG/Atlas Vector] Returned ${results.length} results`);
+      return { results, source: "vector" };
+    } catch (err) {
+      logger.error("[ragSearch] Atlas vectorSearch failed:", err.message);
+      // Surface error in Atlas environment
+      throw err;
+    }
+  }
+
+  // Local environment logic: Try local vector search first
+  try {
+    const localResults = await localVectorSearch(embedding, limit);
+    if (localResults && localResults.length >= 3) {
+      return { results: localResults, source: "local_vector" };
+    }
+  } catch (err) {
+    logger.debug("[RAG] Local vector search fallback failed:", err.message);
+  }
+
+  // Step 3: Fall back to MongoDB standard full-text search locally
+  const textResults = await mongoTextSearch(query, limit);
+  return { results: textResults, source: "text" };
 };
 
 /**
@@ -116,6 +177,22 @@ export const storeProductEmbedding = async (product) => {
     if (existingProduct) {
       if (embedding) existingProduct.embeddings = embedding;
       existingProduct.lastUpdated = new Date();
+      
+      // Update other fields as well to keep DB data fresh
+      existingProduct.name = product.name || existingProduct.name;
+      existingProduct.description = product.description || existingProduct.description;
+      existingProduct.category = product.category || existingProduct.category;
+      existingProduct.brand = product.brand || existingProduct.brand;
+      existingProduct.price = product.price || existingProduct.price;
+      existingProduct.rating = product.rating || existingProduct.rating;
+      existingProduct.availability = product.availability || existingProduct.availability;
+      existingProduct.seller = product.seller || existingProduct.seller;
+      existingProduct.features = product.features || existingProduct.features;
+      existingProduct.specifications = product.specifications || existingProduct.specifications;
+      existingProduct.images = (product.images && product.images.length > 0) ? product.images : existingProduct.images;
+      existingProduct.source = product.source || existingProduct.source;
+      existingProduct.aiSummary = product.aiSummary || existingProduct.aiSummary;
+
       await existingProduct.save();
       return existingProduct;
     }

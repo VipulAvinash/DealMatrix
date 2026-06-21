@@ -1,8 +1,8 @@
 import mongoose from "mongoose";
 import PQueue from "p-queue";
 import { searchAmazonWithGrok } from "./ai/grok.service.js";
-import { searchFlipkartWithGemini } from "./ai/gemini.service.js";
-import { searchGlobalWithOpenRouter, aggregateWithAI } from "./ai/openrouter.service.js";
+import { searchFlipkartWithGemini, searchAmazonWithGemini } from "./ai/gemini.service.js";
+import { searchGlobalWithOpenRouter, aggregateWithAI, generateEmbedding } from "./ai/openrouter.service.js";
 import { ragSearch, storeProductEmbedding } from "./rag/ragService.js";
 import { getCache, setCache, normalizeCacheKey } from "./cache/cacheService.js";
 import SearchHistory from "../models/SearchHistory.model.js";
@@ -26,11 +26,19 @@ export const searchProducts = async (query, filters = {}, options = {}) => {
   let cacheHit = false;
 
   try {
-    // ─── Step 1: Check Cache ────────────────────────────────────────────────
+    // ─── Step 1: Redis Cache (Always First — O(1), no DB hit) ────────────────
     const cached = await getCache(cacheKey);
     if (cached) {
       cacheHit = true;
       logger.info(`[Search] Cache HIT for "${query}" (${cached.source})`);
+
+      // Cache individual products in Redis on cache hit as well to prevent 404s for stale/cached searches
+      if (cached.data?.products && cached.data.products.length > 0) {
+        const cachePromises = cached.data.products.map((p) =>
+          setCache(`product:${p._id}`, p, 60 * 60)
+        );
+        await Promise.allSettled(cachePromises);
+      }
 
       await recordSearch(query, filters, {
         ...options,
@@ -45,30 +53,62 @@ export const searchProducts = async (query, filters = {}, options = {}) => {
       };
     }
 
-    // ─── Step 2: RAG Search (previously cached products) ───────────────────
-    logger.info(`[Search] RAG search for "${query}"`);
-    const { results: ragResults, source: ragSource } = await ragSearch(query, 5);
+    // Generate query embedding (reused for RAG query)
+    const embedding = await generateEmbedding(query);
 
-    if (ragResults.length >= 3) {
-      logger.info(`[Search] RAG returned ${ragResults.length} results — skipping AI search`);
+    // ─── Step 2: DB Lookup (One call, env-appropriate strategy) ───────────────
+    logger.info(`[Search] DB lookup first for "${query}"`);
+    const { results: ragResults, source: ragSource } = await ragSearch(query, embedding, 5);
+
+    const hasMockData = ragResults.some((p) => {
+      const img = p.images?.[0] || "";
+      const url = p.source?.url || "";
+      return !img || 
+             img.includes("unsplash.com/photo-") || 
+             img.includes("example.com") ||
+             img.includes("loremflickr") ||
+             img.includes("placeholder") ||
+             img.includes("picsum.photos") ||
+             !url ||
+             url.toLowerCase().includes("example") ||
+             url.toLowerCase().includes("placeholder") ||
+             !url.startsWith("http");
+    });
+
+    if (ragResults.length >= 3 && !hasMockData) {
+      logger.info(`[Search] DB returned ${ragResults.length} results — skipping AI search`);
 
       const result = buildSearchResult(ragResults, ragResults, query, {
-        source: "rag",
+        source: "database",
         ragSource,
         responseTimeMs: Date.now() - startTime,
       });
 
-      await setCache(cacheKey, result, 15 * 60); // 15 min for RAG results
+      await setCache(cacheKey, result, 60 * 60); // 1 hour for DB results
+
+      // Cache each product individually in Redis
+      if (ragResults && ragResults.length > 0) {
+        const cachePromises = ragResults.map((p) =>
+          setCache(`product:${p._id}`, p, 60 * 60)
+        );
+        await Promise.allSettled(cachePromises);
+      }
+
       await recordSearch(query, filters, { ...options, resultsCount: ragResults.length, responseTimeMs: Date.now() - startTime });
 
       return result;
+    } else if (ragResults.length >= 3 && hasMockData) {
+      logger.info(`[Search] DB returned results but they contain mock data — forcing live grounding search`);
     }
 
     // ─── Step 3: Parallel AI Search ─────────────────────────────────────────
     logger.info(`[Search] Running parallel AI search for "${query}"`);
 
     const [amazonResults, flipkartResults, globalResults] = await Promise.allSettled([
-      apiQueue.add(() => searchAmazonWithGrok(query, filters)),
+      apiQueue.add(async () => {
+        logger.info(`[Search] Skipping Grok (no billing credits) — using Gemini for Amazon search`);
+        return await searchAmazonWithGemini(query, filters);
+      }),
       apiQueue.add(() => searchFlipkartWithGemini(query, filters)),
       apiQueue.add(() => searchGlobalWithOpenRouter(query, filters)),
     ]);
@@ -77,18 +117,60 @@ export const searchProducts = async (query, filters = {}, options = {}) => {
     const flipkart = flipkartResults.status === "fulfilled" ? flipkartResults.value : [];
     const global = globalResults.status === "fulfilled" ? globalResults.value : [];
 
-    // Combine all results
-    const allProducts = [...amazon, ...flipkart, ...global, ...ragResults];
+    // Combine all results — DB results first to preserve existing MongoDB ObjectIds during deduplication
+    const allProducts = [...ragResults, ...amazon, ...flipkart, ...global];
 
     // ─── Step 4: Deduplicate & Rank ─────────────────────────────────────────
     const uniqueProducts = deduplicateProducts(allProducts);
     const rankedProducts = rankProducts(uniqueProducts);
 
-    // Assign ObjectId to any products that don't have one (e.g. live AI search results)
-    // to ensure they have consistent, valid IDs for detail links and DB storage
+    // Build image propagation map based on name keywords
+    const imagesByModel = {};
+    rankedProducts.forEach((p) => {
+      const img = p.images?.[0];
+      const isReal = img && 
+        !img.includes("example.com") && 
+        !img.includes("loremflickr") && 
+        !img.includes("placeholder") && 
+        !img.includes("picsum.photos");
+
+      if (isReal) {
+        const key = p.name.toLowerCase().replace(/[^a-z0-9]/g, " ").split(/\s+/).slice(0, 4).join(" ");
+        if (key && !imagesByModel[key]) {
+          imagesByModel[key] = img;
+        }
+      }
+    });
+
+    // Assign ObjectId and fix placeholder images for any products that don't have them
+    // to ensure they have consistent, valid IDs and high-quality images for detail links and DB storage
     rankedProducts.forEach((product) => {
       if (!product._id) {
         product._id = new mongoose.Types.ObjectId();
+      }
+
+      let images = product.images || [];
+      const isPlaceholder = !images[0] || 
+        images[0].includes("example.com") || 
+        images[0].includes("loremflickr") || 
+        images[0].includes("placeholder") || 
+        images[0].includes("picsum.photos");
+
+      if (isPlaceholder) {
+        const key = product.name.toLowerCase().replace(/[^a-z0-9]/g, " ").split(/\s+/).slice(0, 4).join(" ");
+        let propagatedImage = null;
+        for (const k of Object.keys(imagesByModel)) {
+          if (key.includes(k) || k.includes(key)) {
+            propagatedImage = imagesByModel[k];
+            break;
+          }
+        }
+
+        if (propagatedImage) {
+          product.images = [propagatedImage];
+        } else {
+          product.images = [getProductImage(product.name, product.category)];
+        }
       }
     });
 
@@ -110,6 +192,14 @@ export const searchProducts = async (query, filters = {}, options = {}) => {
 
     // ─── Step 7: Cache & Store ──────────────────────────────────────────────
     await setCache(cacheKey, result, 60 * 60); // 1 hour cache
+
+    // Cache each product individually in Redis for 1 hour to prevent 404s
+    if (rankedProducts && rankedProducts.length > 0) {
+      const cachePromises = rankedProducts.map((p) =>
+        setCache(`product:${p._id}`, p, 60 * 60)
+      );
+      await Promise.allSettled(cachePromises);
+    }
 
     // Store products in DB for future RAG (non-blocking)
     storeProductsAsync(rankedProducts.slice(0, 10), query);
@@ -190,26 +280,102 @@ const rankProducts = (products) => {
 };
 
 /**
- * Build standardized search result object
+ * Get a matching high-quality category or brand specific Unsplash image
  */
-const buildSearchResult = (products, rawProducts, query, meta) => {
-  // Ensure every product has a valid display image for the UI since AI simulates the URLs
-  // Also, replace hallucinated 404 URLs with working search URLs for each platform
-  const processedProducts = products.map((product) => {
-    let images = product.images || [];
-    
-    // 1. Fix Images: Use a highly reliable picsum.photos seed based placeholder
-    if (images.length === 0 || (images[0] && images[0].includes("example.com")) || (images[0] && images[0].includes("loremflickr"))) {
-      const seed = encodeURIComponent((product.name || "product").replace(/\s+/g, "").substring(0, 15));
-      images = [`https://picsum.photos/seed/${seed}/400/400`];
-    }
+const getProductImage = (name = "", category = "") => {
+  const lowercaseName = name.toLowerCase();
+  const lowercaseCat = (category || "").toLowerCase();
 
-    // 2. Fix URLs: AI hallucinates fake product IDs leading to 404s. 
-    // Replace with a real search URL for that platform so the link always works.
-    let url = product.source?.url;
-    const platform = product.source?.platform || "other";
-    const encodedName = encodeURIComponent(product.name || query);
-    
+  // Smartphones / Mobiles
+  if (lowercaseName.includes("iphone")) {
+    return "https://images.unsplash.com/photo-1510557880182-3d4d3cba35a5?auto=format&fit=crop&w=400&h=400&q=80"; // iPhone
+  }
+  if (lowercaseName.includes("samsung") && (lowercaseName.includes("galaxy") || lowercaseName.includes("s25") || lowercaseName.includes("s24"))) {
+    return "https://images.unsplash.com/photo-1610945265064-0e34e5519bbf?auto=format&fit=crop&w=400&h=400&q=80"; // Samsung Galaxy
+  }
+  if (lowercaseName.includes("oneplus")) {
+    return "https://images.unsplash.com/photo-1598327105666-5b89351aff97?auto=format&fit=crop&w=400&h=400&q=80"; // OnePlus phone
+  }
+  if (lowercaseCat.includes("phone") || lowercaseCat.includes("mobile") || lowercaseName.includes("phone") || lowercaseName.includes("mobile")) {
+    return "https://images.unsplash.com/photo-1511707171634-5f897ff02aa9?auto=format&fit=crop&w=400&h=400&q=80"; // Generic smartphone
+  }
+
+  // Laptops / Computers
+  if (lowercaseName.includes("macbook")) {
+    return "https://images.unsplash.com/photo-1517336714731-489689fd1ca8?auto=format&fit=crop&w=400&h=400&q=80"; // MacBook
+  }
+  if (lowercaseCat.includes("laptop") || lowercaseName.includes("laptop") || lowercaseName.includes("notebook")) {
+    return "https://images.unsplash.com/photo-1496181130204-755241524eab?auto=format&fit=crop&w=400&h=400&q=80"; // Generic Laptop
+  }
+
+  // Tablets
+  if (lowercaseCat.includes("tablet") || lowercaseName.includes("ipad") || lowercaseName.includes("tablet")) {
+    return "https://images.unsplash.com/photo-1544244015-0df4b3ffc6b0?auto=format&fit=crop&w=400&h=400&q=80"; // Tablet
+  }
+
+  // Audio / Headphones
+  if (lowercaseName.includes("sony") && lowercaseName.includes("wh-")) {
+    return "https://images.unsplash.com/photo-1546435770-a3e426bf472b?auto=format&fit=crop&w=400&h=400&q=80"; // Sony headphones
+  }
+  if (lowercaseCat.includes("audio") || lowercaseCat.includes("headphone") || lowercaseName.includes("headphone") || lowercaseName.includes("earbuds")) {
+    return "https://images.unsplash.com/photo-1505740420928-5e560c06d30e?auto=format&fit=crop&w=400&h=400&q=80"; // Headphones
+  }
+
+  // Smartwatches / Wearables
+  if (lowercaseCat.includes("wearable") || lowercaseCat.includes("watch") || lowercaseName.includes("watch")) {
+    return "https://images.unsplash.com/photo-1523275335684-37898b6baf30?auto=format&fit=crop&w=400&h=400&q=80"; // Smartwatch
+  }
+
+  // Cameras
+  if (lowercaseCat.includes("camera") || lowercaseName.includes("camera") || lowercaseName.includes("canon") || lowercaseName.includes("nikon")) {
+    return "https://images.unsplash.com/photo-1516035069371-29a1b244cc32?auto=format&fit=crop&w=400&h=400&q=80"; // Camera
+  }
+
+  // TVs
+  if (lowercaseCat.includes("tv") || lowercaseCat.includes("television") || lowercaseName.includes("tv") || lowercaseName.includes("television")) {
+    return "https://images.unsplash.com/photo-1593305841991-05c297ba4575?auto=format&fit=crop&w=400&h=400&q=80"; // TV
+  }
+
+  // Gaming
+  if (lowercaseName.includes("playstation") || lowercaseName.includes("ps5") || lowercaseName.includes("xbox") || lowercaseName.includes("nintendo")) {
+    return "https://images.unsplash.com/photo-1606144042614-b2417e99c4e3?auto=format&fit=crop&w=400&h=400&q=80"; // Gaming Console
+  }
+
+  // Default fallback (generic clean product box)
+  return "https://images.unsplash.com/photo-1526170375885-4d8ecf77b99f?auto=format&fit=crop&w=400&h=400&q=80";
+};
+
+/**
+ * Normalize and fix product fields: fallback image and URL corrections
+ */
+export const normalizeProduct = (product, fallbackQuery = "") => {
+  if (!product) return product;
+
+  // Handle mongoose document vs plain object
+  const productObj = typeof product.toObject === "function" ? product.toObject() : product;
+
+  let images = productObj.images || [];
+  const isPlaceholder = !images[0] || 
+    images[0].includes("example.com") || 
+    images[0].includes("loremflickr") || 
+    images[0].includes("placeholder") || 
+    images[0].includes("picsum.photos");
+
+  if (isPlaceholder) {
+    images = [getProductImage(productObj.name, productObj.category)];
+  }
+
+  let url = productObj.source?.url;
+  const platform = productObj.source?.platform || "other";
+  const searchName = productObj.name || fallbackQuery;
+  const encodedName = encodeURIComponent(searchName || "");
+  
+  const isFakeUrl = !url || 
+    url.toLowerCase().includes("example") || 
+    url.toLowerCase().includes("placeholder") || 
+    !url.startsWith("http");
+
+  if (isFakeUrl && encodedName) {
     switch (platform) {
       case "amazon":
         url = `https://www.amazon.com/s?k=${encodedName}`;
@@ -221,17 +387,25 @@ const buildSearchResult = (products, rawProducts, query, meta) => {
         url = `https://www.reliancedigital.in/search?q=${encodedName}`;
         break;
       case "croma":
-        url = `https://www.croma.com/searchB?q=${encodedName}`;
+        url = `https://www.croma.com/search/?q=${encodedName}`;
         break;
       default:
         url = `https://www.google.com/search?tbm=shop&q=${encodedName}`;
         break;
     }
-    
-    const source = { ...product.source, url };
-    
-    return { ...product, images, source };
-  });
+  }
+
+  const source = { ...productObj.source, url };
+  return { ...productObj, images, source };
+};
+
+/**
+ * Build standardized search result object
+ */
+const buildSearchResult = (products, rawProducts, query, meta) => {
+  // Ensure every product has a valid display image for the UI since AI simulates the URLs
+  // Also, replace hallucinated 404 URLs with working search URLs for each platform
+  const processedProducts = products.map((product) => normalizeProduct(product, query));
 
   return {
     query,

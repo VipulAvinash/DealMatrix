@@ -89,6 +89,10 @@ const startServer = async () => {
   }
 };
 
-startServer();
+if (process.env.NODE_ENV !== "test") {
+  startServer();
+} else {
+  connectDB().catch((err) => logger.error("Test DB connection failed:", err));
+}
 
 export default app;

@@ -39,7 +39,7 @@ export const searchAmazonWithGrok = async (query, filters = {}) => {
     const prompt = AMAZON_SEARCH_PROMPT(query, filters);
 
     const response = await grokClient.post("/chat/completions", {
-      model: "grok-beta",
+      model: "grok-2",
       messages: [
         {
           role: "system",
@@ -68,6 +68,7 @@ export const searchAmazonWithGrok = async (query, filters = {}) => {
     logger.error("[Grok] Amazon search failed:", {
       message: error.message,
       status: error.response?.status,
+      data: error.response?.data,
     });
     return []; // Graceful degradation
   }

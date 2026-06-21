@@ -12,6 +12,9 @@ node_modules/
 server/.env
 client/.env
 
+scratch
+
+
 # Build outputs
 dist/
 build/

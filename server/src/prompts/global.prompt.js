@@ -6,10 +6,12 @@ export const GLOBAL_SEARCH_PROMPT = (query, filters = {}) => {
 
 Generate products from these platforms: Reliance Digital, Croma
 
-Return a JSON array of 4-6 products from various platforms:
+Return a JSON array of 4-6 products from various platforms. Do NOT use generic placeholders for URLs or images. You must return real, actual, or highly accurate product detail page URLs and real, working product image URLs from Croma's CDN (media.croma.com/prod/...) or Reliance Digital's CDN (www.reliancedigital.in/medias/...) that match the exact product model. Ensure each product has a unique, correct image corresponding to its specific color/model.
+
+Required JSON structure:
 [
   {
-    "name": "Product name",
+    "name": "Product name with variant",
     "description": "Description",
     "category": "Category",
     "brand": "Brand",
@@ -33,11 +35,11 @@ Return a JSON array of 4-6 products from various platforms:
       "rating": 4.5
     },
     "features": ["feature 1", "feature 2"],
-    "images": [],
+    "images": ["https://www.reliancedigital.in/medias/OnePlus-9-Pro-5G-Smartphones-491997725-i-1-1200Wx1200H?context=bWFzdGVyfGltYWdlc3w4OTAzNnxpbWFnZS9qcGVnfGltYWdlcy9oNGYvaGE0Lzk1MTAxMTMxMzk3NDIuanBnfGJiNDUzYTVlZjNmMTUxNDQ0NjYyODFmYzNhZmM2YTU1YTliYTk2ZjUwMjAxMTY4ODQwOTBlNzU3MWU2ZWM5Yjk"],
     "source": {
       "platform": "reliance",
-      "url": "https://reliancedigital.in/site/product/example",
-      "productId": "SKU123456"
+      "url": "https://www.reliancedigital.in/oneplus-9-pro-5d-smartphone/p/491997725",
+      "productId": "491997725"
     },
     "tags": ["electronics", "top-rated"]
   }
@@ -51,6 +53,7 @@ Rules:
 - Realistic prices for each platform's market
 - Source platform field must be one of: "reliance", "croma", "other"
 - All relevant to: "${query}"
+- image and url: must be real and specific to the exact product model. Do not repeat the same image or use placeholders.
 - Return ONLY the JSON array, no markdown`;
 };
 

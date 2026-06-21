@@ -2,6 +2,7 @@ import axios from "axios";
 import axiosRetry from "axios-retry";
 import { logger } from "../../utils/logger.js";
 import { GLOBAL_SEARCH_PROMPT, AGGREGATION_PROMPT } from "../../prompts/global.prompt.js";
+import { searchWithGrounding } from "./gemini.service.js";
 
 const openRouterClient = axios.create({
   baseURL: "https://openrouter.ai/api/v1",
@@ -24,49 +25,19 @@ axiosRetry(openRouterClient, {
 });
 
 /**
- * Search global platforms (Reliance, Croma) using OpenRouter
+ * Search global platforms (Reliance, Croma) using Gemini search grounding
  * @param {string} query - Product search query
  * @param {Object} filters - Optional filters
  * @returns {Promise<Array>} Array of products
  */
 export const searchGlobalWithOpenRouter = async (query, filters = {}) => {
-  if (!process.env.OPENROUTER_API_KEY) {
-    logger.warn("OpenRouter API key not configured — skipping global search");
-    return [];
-  }
-
   try {
-    logger.info(`[OpenRouter] Global search for: "${query}"`);
-
-    const prompt = GLOBAL_SEARCH_PROMPT(query, filters);
-
-    const response = await openRouterClient.post("/chat/completions", {
-      model: "anthropic/claude-3-haiku",
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are a product aggregation AI. Respond only with a valid JSON array of product objects from multiple platforms. No markdown, no explanations.",
-        },
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-      temperature: 0.1,
-      max_tokens: 6000,
-    });
-
-    const content = response.data.choices[0]?.message?.content || "[]";
-    const products = parseAIResponse(content);
-
-    logger.info(`[OpenRouter] Found ${products.length} global products`);
+    logger.info(`[OpenRouter/Gemini] Global search (Reliance/Croma) for: "${query}"`);
+    const products = await searchWithGrounding(query, "global", filters);
+    logger.info(`[OpenRouter/Gemini] Found ${products.length} global products`);
     return products;
   } catch (error) {
-    logger.error("[OpenRouter] Global search failed:", {
-      message: error.message,
-      status: error.response?.status,
-    });
+    logger.error("[OpenRouter/Gemini] Global search failed:", error.message);
     return [];
   }
 };
